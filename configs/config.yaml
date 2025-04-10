@@ -1,0 +1,19 @@
+"camera": {
+    "camera_id": 0,
+    "window_size": [1200, 800],
+}
+
+"process": {
+    "field_width": 450, # should be divisible by 9
+    "threshold": 0.3,
+    "utils": {
+        "line_thick": 3,
+        "mode": 'max_contou', # binary, max_contour
+    }  
+}
+
+"nn": {
+    "learning_rate": 1e-3,
+    "batch_size": 256,
+    "weight_decay": 1e-3,
+}
