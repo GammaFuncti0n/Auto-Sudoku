@@ -1,4 +1,3 @@
-import cv2
 import yaml
 
 from scripts import Task

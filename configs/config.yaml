@@ -4,11 +4,14 @@
 }
 
 "process": {
-    "field_width": 450, # should be divisible by 9
-    "threshold": 0.3,
+    "field_width": 540, # should be divisible by 9
+    "patch_size": 80,
+    "nonzeros_treshold": 0.01,
+    "contrast_treshold": 0.33,
+    #"threshold": 0.4,
     "utils": {
-        "line_thick": 3,
-        "mode": 'max_contou', # binary, max_contour
+        "line_thick": 2,
+        "mode": 'homography', # binary, max_contour, homography, tensor, predictions, predictions_homography, main
     }  
 }
 
