@@ -3,7 +3,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torchvision import transforms
+
 from model import SimpleCNN
+from .sudoku_solver import SudokuSolver
 
 class Camera():
     def __init__(self, camera_config):
@@ -17,11 +19,14 @@ class Camera():
 class FrameProcessor():
     def __init__(self, process_config):
         self.process_config = process_config
-        #self.threshold = process_config['threshold']
         self.field_width = process_config['field_width']  
         self.patch_size = process_config['patch_size']  
         self.nonzeros_treshold = process_config['nonzeros_treshold']
         self.contrast_treshold = process_config['contrast_treshold']
+        self.nonzeros_range = process_config['nonzeros_range']
+        self.patch_truncate = process_config['patch_truncate']
+        self.patch_binarization = process_config['patch_binarization']
+
         self.line_thick = process_config['utils']['line_thick']
         self.mode = process_config['utils']['mode']
 
@@ -32,7 +37,7 @@ class FrameProcessor():
         Create and load model weights.
         """
         self.model = SimpleCNN()
-        self.model.load_state_dict(torch.load('./model/weights/CNN.pth', weights_only=True))
+        self.model.load_state_dict(torch.load('./model/weights/CNN_border.pth', weights_only=True))
 
     def _image2binary(self, image) -> np.ndarray:
         """
@@ -93,16 +98,25 @@ class FrameProcessor():
         """
         Reshape input image to 81 rgb patches (9*9) 
         """
-        width, height, _ = image.shape
-        assert width%9==0 and height%9==0, f'{width%9}, {height%9}'
-        patches = image.reshape(9, width//9, 9, height//9, 3).transpose(0,2,1,3,4).reshape(-1, width//9, height//9, 3)
+        if image.ndim == 3:
+            width, height, channels = image.shape
+            assert width%9==0 and height%9==0, f'{width%9}, {height%9}'
+            patches = image.reshape(9, width//9, 9, height//9, channels).transpose(0,2,1,3,4).reshape(-1, width//9, height//9, channels)
+        elif image.ndim == 2:
+            width, height = image.shape
+            assert width%9==0 and height%9==0, f'{width%9}, {height%9}'
+            patches = image.reshape(9, width//9, 9, height//9).transpose(0,2,1,3).reshape(-1, width//9, height//9)
         return patches
     
     def _patches2image(self, patches) -> np.ndarray:
         """
         Reshape rgb patches to image of field
         """
-        image = patches.reshape(9, 9, self.field_width//9, self.field_width//9, 3).transpose(0, 2, 1, 3, 4).reshape(self.field_width, self.field_width, 3)
+        if patches.ndim == 4:
+            _, width, height, channels = patches.shape
+            image = patches.reshape(9, 9, width, height, channels).transpose(0, 2, 1, 3, 4).reshape(width*9, height*9, channels)
+        elif patches.ndim == 3:
+            image = patches.reshape(9, 9, width, height).transpose(0, 2, 1, 3).reshape(width*9, height*9)
         return image
 
     def _patches_processing(self, patches) -> torch.Tensor:
@@ -112,7 +126,7 @@ class FrameProcessor():
         # Gray and truncate
         gray_patches = np.mean(patches / 255, axis=-1) # rgb2gray
         h = self.field_width // 9
-        dh = int(h / 100 * 5) # 5% of patch
+        dh = int(h * self.patch_truncate)
         truncated_patches = gray_patches[:, dh:h-dh, dh:h-dh]
 
         # ToTensor
@@ -133,17 +147,16 @@ class FrameProcessor():
         tensor_patches = torch.where(low_contrast_mask.view(tensor_patches.shape[0], 1, 1, 1), replacement, tensor_patches)
 
         # Binarization
-        binary_tensor = (tensor_patches > 0.5).to(torch.float32)
+        binary_tensor = (tensor_patches > self.patch_binarization).to(torch.float32)
 
         # Calculate rate of nonzeros in center and filter by them
-        rate = 1/3 # 33% of center
-        i1 = int(self.patch_size * (1 - rate) / 2)
-        i2 = int(self.patch_size * (1 + rate) / 2)
+        i1 = int(self.patch_size * (1 - self.nonzeros_range) / 2)
+        i2 = int(self.patch_size * (1 + self.nonzeros_range) / 2)
         self.nonzeroes_rate = binary_tensor[:, :, i1:i2, i1:i2].mean((-1, -2, -3))
         binary_tensor = torch.where((self.nonzeroes_rate < self.nonzeros_treshold).view(tensor_patches.shape[0], 1, 1, 1), replacement, binary_tensor)
 
         # Normalization
-        normalized_tensor = (binary_tensor - binary_tensor.mean()) / (binary_tensor.std() + 1e-8)
+        normalized_tensor = (binary_tensor - 0.11) / 0.31
 
         return normalized_tensor
     
@@ -152,6 +165,7 @@ class FrameProcessor():
         Main class method.
         Gets a frame from a video, applies all transformations and returns a modified frame for display on the screen.
         """
+        #flag = ((frame/255).std()<0.1)
         binary_image = self._image2binary(frame)     
         self._find_max_contour(binary_image)
 
@@ -203,6 +217,9 @@ class FrameProcessor():
         model_output = self.model(patches_tensor[self.nonzeroes_rate >= self.nonzeros_treshold])
         prediction = torch.zeros(81, dtype=torch.long)
         prediction[self.nonzeroes_rate >= self.nonzeros_treshold] = (model_output.argmax(-1) + 1)
+
+        sudoku_field = prediction.numpy().reshape(9,9)
+        sudoku_solver = SudokuSolver(sudoku_field)
         
         if(self.mode=='predictions'):  
             rec_p = self._patches2image(patches)
@@ -235,7 +252,7 @@ class FrameProcessor():
                 cv2.putText(
                     rec_p,
                     text=text,
-                    org=[i//9*self.field_width//9+10, i%9*self.field_width//9+30], 
+                    org=[i%9*self.field_width//9+10, i//9*self.field_width//9+30], 
                     fontFace=cv2.FONT_HERSHEY_SIMPLEX,
                     fontScale=1.0,
                     color=(0, 255, 0),
@@ -248,4 +265,34 @@ class FrameProcessor():
             frame[mask] = output_field[mask]
             return frame
         
+        if(self.mode=='main'):
+            if(sudoku_solver.is_valid):
+                flag = sudoku_solver.solve()
+                if(flag):
+                    board = sudoku_solver.board.reshape(81)
+
+                    rec_p = np.zeros((self.patch_size*9, self.patch_size*9, 3))
+                    #rec_p = self._patches2image(patches)
+                    for i in range(81):
+                        if self.nonzeroes_rate[i] < self.nonzeros_treshold:
+                            text = f'{board[i]}'
+                        else:
+                            text = ''
+
+                        cv2.putText(
+                            rec_p,
+                            text=text,
+                            org=[i%9*self.field_width//9+10, i//9*self.field_width//9+30], 
+                            fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+                            fontScale=1.0,
+                            color=(10, 10, 10),
+                            thickness=self.line_thick,
+                            lineType=cv2.LINE_AA
+                            )
+                    inverse_H = np.linalg.inv(self.H)
+                    output_field = cv2.warpPerspective(rec_p, inverse_H, (frame.shape[1], frame.shape[0]))
+                    mask = (output_field!=0)
+                    frame[mask] = output_field[mask]
+            return frame
+
         return frame
