@@ -82,9 +82,9 @@ class FrameProcessor():
         homography_field = cv2.warpPerspective(image, self.H, (self.field_width, self.field_width))
 
         # Truncate field 2.8% from each side
-        i_1 = int(self.field_width * 0.25 / 9)
-        i_2 = int(self.field_width * (1 - 0.25 / 9))
-        truncated_field = homography_field[i_1:i_2, i_1:i_2]
+        i1 = int(self.field_width * 0.25 / 9)
+        i2 = int(self.field_width * (1 - 0.25 / 9))
+        truncated_field = homography_field[i1:i2, i1:i2]
         square_field = cv2.resize(truncated_field, (self.field_width, self.field_width))
 
         return square_field
@@ -105,49 +105,48 @@ class FrameProcessor():
         image = patches.reshape(9, 9, self.field_width//9, self.field_width//9, 3).transpose(0, 2, 1, 3, 4).reshape(self.field_width, self.field_width, 3)
         return image
 
-    def _patches2tensor(self, patches):
-        patches = np.mean(patches/255, axis=-1) # rgb2gray
-        h = (self.field_width//9)
-        dh = int(h/100*5) # 5% of patch
-        patches = patches[:,dh:h-dh,dh:h-dh]
+    def _patches_processing(self, patches) -> torch.Tensor:
+        """
+        Processes patches, converts them into tensors for feeding into the model
+        """
+        # Gray and truncate
+        gray_patches = np.mean(patches / 255, axis=-1) # rgb2gray
+        h = self.field_width // 9
+        dh = int(h / 100 * 5) # 5% of patch
+        truncated_patches = gray_patches[:, dh:h-dh, dh:h-dh]
 
+        # ToTensor
         transformation = transforms.Compose([
             transforms.ToTensor(),
             transforms.Resize((self.patch_size,self.patch_size)),
         ])
-        tensor = 1 - torch.stack([transformation(img) for img in patches]).to(torch.float32)
+        tensor_patches = 1 - torch.stack([transformation(img) for img in truncated_patches]).to(torch.float32)
 
         # Min-Max normalization
-        mins = tensor.view(81, -1).min(dim=1)[0].view(-1, 1, 1, 1)
-        maxs = tensor.view(81, -1).max(dim=1)[0].view(-1, 1, 1, 1)
-        ranges = maxs - mins
-        low_contrast_mask = (ranges < self.contrast_treshold)
-        tensor = (tensor - mins) / (maxs - mins + 1e-8)
+        mins = tensor_patches.view(81, -1).min(dim=1)[0].view(-1, 1, 1, 1)
+        maxs = tensor_patches.view(81, -1).max(dim=1)[0].view(-1, 1, 1, 1)
+        tensor_patches = (tensor_patches - mins) / (maxs - mins + 1e-8)
 
-        # Zeros for empty patch
-        replacement = torch.zeros_like(tensor)
-        tensor = torch.where(low_contrast_mask.view(tensor.shape[0], 1, 1, 1), replacement, tensor)
+        replacement = torch.zeros_like(tensor_patches)
+        # Low contrast filtering
+        low_contrast_mask = ((maxs - mins) < self.contrast_treshold)
+        tensor_patches = torch.where(low_contrast_mask.view(tensor_patches.shape[0], 1, 1, 1), replacement, tensor_patches)
 
-        # Binarization patches and calculate rate of nonzeroes values in center
-        binary_tensor = (tensor>0.5).to(torch.float32)
-        nonzeroes_rate = binary_tensor[:,:,int(self.patch_size/3):int(2*self.patch_size/3),int(self.patch_size/3):int(2*self.patch_size/3)].mean((-1,-2,-3))
-        binary_tensor = torch.where((nonzeroes_rate < self.nonzeros_treshold).view(tensor.shape[0], 1, 1, 1), replacement, binary_tensor)
+        # Binarization
+        binary_tensor = (tensor_patches > 0.5).to(torch.float32)
 
-        # Normal normalization
+        # Calculate rate of nonzeros in center and filter by them
+        rate = 1/3 # 33% of center
+        i1 = int(self.patch_size * (1 - rate) / 2)
+        i2 = int(self.patch_size * (1 + rate) / 2)
+        self.nonzeroes_rate = binary_tensor[:, :, i1:i2, i1:i2].mean((-1, -2, -3))
+        binary_tensor = torch.where((self.nonzeroes_rate < self.nonzeros_treshold).view(tensor_patches.shape[0], 1, 1, 1), replacement, binary_tensor)
+
+        # Normalization
         normalized_tensor = (binary_tensor - binary_tensor.mean()) / (binary_tensor.std() + 1e-8)
 
-        return normalized_tensor, nonzeroes_rate
+        return normalized_tensor
     
-    def _reconstract(self, patches):
-        reconstructed_field = patches.reshape(9, 9, self.field_width//9, self.field_width//9, 3).transpose(0, 2, 1, 3, 4).reshape(self.field_width, self.field_width, 3)
-
-        for x in range(self.field_width//9, self.field_width, self.field_width//9):
-            reconstructed_field[:, x-self.line_thick//2:x+self.line_thick//2, :] = (0, 255, 0)
-        for y in range(self.field_width//9, self.field_width, self.field_width//9):
-            reconstructed_field[y-self.line_thick//2:y+self.line_thick//2, :, :] = (0, 255, 0)
-
-        return reconstructed_field
-
     def run(self, frame) -> np.ndarray:
         """
         Main class method.
@@ -197,18 +196,18 @@ class FrameProcessor():
             
             return reconstructed_image
         
-        patches_tensor, nonzeroes_rate = self._patches2tensor(patches)
+        patches_tensor = self._patches_processing(patches)
         if(self.mode=='tensor'):
             return patches_tensor.numpy().reshape(9,9,1,self.patch_size,self.patch_size).transpose(0,3,1,4,2).reshape(self.patch_size*9, self.patch_size*9)
         
-        model_output = self.model(patches_tensor[nonzeroes_rate >= self.nonzeros_treshold])
+        model_output = self.model(patches_tensor[self.nonzeroes_rate >= self.nonzeros_treshold])
         prediction = torch.zeros(81, dtype=torch.long)
-        prediction[nonzeroes_rate >= self.nonzeros_treshold] = (model_output.argmax(-1) + 1)
+        prediction[self.nonzeroes_rate >= self.nonzeros_treshold] = (model_output.argmax(-1) + 1)
         
         if(self.mode=='predictions'):  
             rec_p = self._patches2image(patches)
             for i in range(81):
-                if nonzeroes_rate[i] >= self.nonzeros_treshold:
+                if self.nonzeroes_rate[i] >= self.nonzeros_treshold:
                     text = f'{prediction[i]}'
                 else:
                     text = '?'
@@ -228,7 +227,7 @@ class FrameProcessor():
         if(self.mode=='predictions_homography'):
             rec_p = self._patches2image(patches)
             for i in range(81):
-                if nonzeroes_rate[i] >= self.nonzeros_treshold:
+                if self.nonzeroes_rate[i] >= self.nonzeros_treshold:
                     text = f'{prediction[i]}'
                 else:
                     text = '?'
