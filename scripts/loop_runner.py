@@ -18,10 +18,7 @@ class Task():
         while True:
             ret, frame = camera.cap.read()
             assert ret, "Can not get frame"
-            #try:
             processed_frame = frame_processor.run(frame)
-            #except:
-            #    processed_frame = frame
             cv2.imshow('Camera', processed_frame)
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
